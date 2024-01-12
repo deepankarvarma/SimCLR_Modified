@@ -5,6 +5,10 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.distributed.parallel_loader as pl
+
 from simclr import SimCLR
 from simclr.modules import LogisticRegression, get_resnet
 from simclr.modules.transformations import TransformsSimCLR
@@ -59,14 +63,18 @@ def create_data_loaders_from_arrays(X_train, y_train, X_test, y_test, batch_size
     return train_loader, test_loader
 
 
-def train(args, loader, simclr_model, model, criterion, optimizer):
+def train_fn(args, loader, simclr_model, model, criterion, optimizer):
     loss_epoch = 0
     accuracy_epoch = 0
+    device = xm.xla_device()
+
+    model, optimizer, loader = xmp.parallel_unordered(model, optimizer, loader)
+
     for step, (x, y) in enumerate(loader):
         optimizer.zero_grad()
 
-        x = x.to(args.device)
-        y = y.to(args.device)
+        x = x.to(device)
+        y = y.to(device)
 
         output = model(x)
         loss = criterion(output, y)
@@ -76,26 +84,24 @@ def train(args, loader, simclr_model, model, criterion, optimizer):
         accuracy_epoch += acc
 
         loss.backward()
-        optimizer.step()
+        xm.optimizer_step(optimizer)
 
         loss_epoch += loss.item()
-        # if step % 100 == 0:
-        #     print(
-        #         f"Step [{step}/{len(loader)}]\t Loss: {loss.item()}\t Accuracy: {acc}"
-        #     )
 
     return loss_epoch, accuracy_epoch
 
 
-def test(args, loader, simclr_model, model, criterion, optimizer):
+def test_fn(args, loader, simclr_model, model, criterion, optimizer):
     loss_epoch = 0
     accuracy_epoch = 0
     model.eval()
+    device = xm.xla_device()
+
     for step, (x, y) in enumerate(loader):
         model.zero_grad()
 
-        x = x.to(args.device)
-        y = y.to(args.device)
+        x = x.to(device)
+        y = y.to(device)
 
         output = model(x)
         loss = criterion(output, y)
@@ -109,14 +115,8 @@ def test(args, loader, simclr_model, model, criterion, optimizer):
     return loss_epoch, accuracy_epoch
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SimCLR")
-    config = yaml_config_hook("./config/config.yaml")
-    for k, v in config.items():
-        parser.add_argument(f"--{k}", default=v, type=type(v))
-
-    args = parser.parse_args()
-    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def main(index, args):
+    args.device = xm.xla_device()
 
     if args.dataset == "STL10":
         train_dataset = torchvision.datasets.STL10(
@@ -147,12 +147,27 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=True
+    )
+
+    test_sampler = torch.utils.data.distributed.DistributedSampler(
+        test_dataset,
+        num_replicas=xm.xrt_world_size(),
+        rank=xm.get_ordinal(),
+        shuffle=False
+    )
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.logistic_batch_size,
-        shuffle=True,
+        shuffle=False,
         drop_last=True,
         num_workers=args.workers,
+        sampler=train_sampler
     )
 
     test_loader = torch.utils.data.DataLoader(
@@ -161,20 +176,19 @@ if __name__ == "__main__":
         shuffle=False,
         drop_last=True,
         num_workers=args.workers,
+        sampler=test_sampler
     )
 
     encoder = get_resnet(args.resnet, pretrained=False)
-    n_features = encoder.fc.in_features  # get dimensions of fc layer
+    n_features = encoder.fc.in_features
 
-    # load pre-trained model from checkpoint
     simclr_model = SimCLR(encoder, args.projection_dim, n_features)
     model_fp = os.path.join(args.model_path, "checkpoint_{}.tar".format(args.epoch_num))
     simclr_model.load_state_dict(torch.load(model_fp, map_location=args.device.type))
     simclr_model = simclr_model.to(args.device)
     simclr_model.eval()
 
-    ## Logistic Regression
-    n_classes = 10  # CIFAR-10 / STL-10
+    n_classes = 10
     model = LogisticRegression(simclr_model.n_features, n_classes)
     model = model.to(args.device)
 
@@ -191,17 +205,27 @@ if __name__ == "__main__":
     )
 
     for epoch in range(args.logistic_epochs):
-        loss_epoch, accuracy_epoch = train(
+        loss_epoch, accuracy_epoch = train_fn(
             args, arr_train_loader, simclr_model, model, criterion, optimizer
         )
         print(
             f"Epoch [{epoch}/{args.logistic_epochs}]\t Loss: {loss_epoch / len(arr_train_loader)}\t Accuracy: {accuracy_epoch / len(arr_train_loader)}"
         )
 
-    # final testing
-    loss_epoch, accuracy_epoch = test(
+    loss_epoch, accuracy_epoch = test_fn(
         args, arr_test_loader, simclr_model, model, criterion, optimizer
     )
     print(
         f"[FINAL]\t Loss: {loss_epoch / len(arr_test_loader)}\t Accuracy: {accuracy_epoch / len(arr_test_loader)}"
     )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SimCLR")
+    config = yaml_config_hook("./config/config.yaml")
+    for k, v in config.items():
+        parser.add_argument(f"--{k}", default=v, type=type(v))
+
+    args = parser.parse_args()
+
+    xmp.spawn(main, args=(args,), nprocs=8, start_method='fork')

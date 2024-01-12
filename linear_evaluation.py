@@ -5,16 +5,11 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.parallel_loader as pl
-
 from simclr import SimCLR
 from simclr.modules import LogisticRegression, get_resnet
 from simclr.modules.transformations import TransformsSimCLR
 
 from utils import yaml_config_hook
-
 
 def inference(loader, simclr_model, device):
     feature_vector = []
@@ -39,12 +34,10 @@ def inference(loader, simclr_model, device):
     print("Features shape {}".format(feature_vector.shape))
     return feature_vector, labels_vector
 
-
 def get_features(simclr_model, train_loader, test_loader, device):
     train_X, train_y = inference(train_loader, simclr_model, device)
     test_X, test_y = inference(test_loader, simclr_model, device)
     return train_X, train_y, test_X, test_y
-
 
 def create_data_loaders_from_arrays(X_train, y_train, X_test, y_test, batch_size):
     train = torch.utils.data.TensorDataset(
@@ -62,13 +55,10 @@ def create_data_loaders_from_arrays(X_train, y_train, X_test, y_test, batch_size
     )
     return train_loader, test_loader
 
-
-def train_fn(args, loader, simclr_model, model, criterion, optimizer):
+def train(args, loader, simclr_model, model, criterion, optimizer):
     loss_epoch = 0
     accuracy_epoch = 0
-    device = xm.xla_device()
-
-    model, optimizer, loader = xmp.parallel_unordered(model, optimizer, loader)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     for step, (x, y) in enumerate(loader):
         optimizer.zero_grad()
@@ -84,18 +74,17 @@ def train_fn(args, loader, simclr_model, model, criterion, optimizer):
         accuracy_epoch += acc
 
         loss.backward()
-        xm.optimizer_step(optimizer)
+        optimizer.step()
 
         loss_epoch += loss.item()
 
     return loss_epoch, accuracy_epoch
 
-
-def test_fn(args, loader, simclr_model, model, criterion, optimizer):
+def test(args, loader, simclr_model, model, criterion, optimizer):
     loss_epoch = 0
     accuracy_epoch = 0
     model.eval()
-    device = xm.xla_device()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     for step, (x, y) in enumerate(loader):
         model.zero_grad()
@@ -114,12 +103,14 @@ def test_fn(args, loader, simclr_model, model, criterion, optimizer):
 
     return loss_epoch, accuracy_epoch
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SimCLR")
+    config = yaml_config_hook("./config/config.yaml")
+    for k, v in config.items():
+        parser.add_argument(f"--{k}", default=v, type=type(v))
 
-def main(index, args):
-    args.device = xm.xla_device()
-    if xm.xla_device() == xm.xla_device(devkind='TPU'):
-        devices = xm.get_xla_supported_devices()
-        xm.xla_device(devices[index], devkind='TPU')
+    args = parser.parse_args()
+
     if args.dataset == "STL10":
         train_dataset = torchvision.datasets.STL10(
             args.dataset_dir,
@@ -149,27 +140,12 @@ def main(index, args):
     else:
         raise NotImplementedError
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset,
-        num_replicas=xm.xrt_world_size(),
-        rank=xm.get_ordinal(),
-        shuffle=True
-    )
-
-    test_sampler = torch.utils.data.distributed.DistributedSampler(
-        test_dataset,
-        num_replicas=xm.xrt_world_size(),
-        rank=xm.get_ordinal(),
-        shuffle=False
-    )
-
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.logistic_batch_size,
-        shuffle=False,
+        shuffle=True,
         drop_last=True,
         num_workers=args.workers,
-        sampler=train_sampler
     )
 
     test_loader = torch.utils.data.DataLoader(
@@ -178,7 +154,6 @@ def main(index, args):
         shuffle=False,
         drop_last=True,
         num_workers=args.workers,
-        sampler=test_sampler
     )
 
     encoder = get_resnet(args.resnet, pretrained=False)
@@ -186,20 +161,20 @@ def main(index, args):
 
     simclr_model = SimCLR(encoder, args.projection_dim, n_features)
     model_fp = os.path.join(args.model_path, "checkpoint_{}.tar".format(args.epoch_num))
-    simclr_model.load_state_dict(torch.load(model_fp, map_location=args.device.type))
-    simclr_model = simclr_model.to(args.device)
+    simclr_model.load_state_dict(torch.load(model_fp, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+    simclr_model = simclr_model.to(device)
     simclr_model.eval()
 
     n_classes = 10
     model = LogisticRegression(simclr_model.n_features, n_classes)
-    model = model.to(args.device)
+    model = model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     criterion = torch.nn.CrossEntropyLoss()
 
     print("### Creating features from pre-trained context model ###")
     (train_X, train_y, test_X, test_y) = get_features(
-        simclr_model, train_loader, test_loader, args.device
+        simclr_model, train_loader, test_loader, device
     )
 
     arr_train_loader, arr_test_loader = create_data_loaders_from_arrays(
@@ -207,27 +182,16 @@ def main(index, args):
     )
 
     for epoch in range(args.logistic_epochs):
-        loss_epoch, accuracy_epoch = train_fn(
+        loss_epoch, accuracy_epoch = train(
             args, arr_train_loader, simclr_model, model, criterion, optimizer
         )
         print(
             f"Epoch [{epoch}/{args.logistic_epochs}]\t Loss: {loss_epoch / len(arr_train_loader)}\t Accuracy: {accuracy_epoch / len(arr_train_loader)}"
         )
 
-    loss_epoch, accuracy_epoch = test_fn(
+    loss_epoch, accuracy_epoch = test(
         args, arr_test_loader, simclr_model, model, criterion, optimizer
     )
     print(
         f"[FINAL]\t Loss: {loss_epoch / len(arr_test_loader)}\t Accuracy: {accuracy_epoch / len(arr_test_loader)}"
     )
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SimCLR")
-    config = yaml_config_hook("./config/config.yaml")
-    for k, v in config.items():
-        parser.add_argument(f"--{k}", default=v, type=type(v))
-
-    args = parser.parse_args()
-
-    xmp.spawn(main, args=(args,), nprocs=8, start_method='fork')

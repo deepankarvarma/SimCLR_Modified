@@ -58,7 +58,7 @@ def create_data_loaders_from_arrays(X_train, y_train, X_test, y_test, batch_size
 def train(args, loader, simclr_model, model, criterion, optimizer):
     loss_epoch = 0
     accuracy_epoch = 0
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device
 
     for step, (x, y) in enumerate(loader):
         optimizer.zero_grad()
@@ -84,7 +84,7 @@ def test(args, loader, simclr_model, model, criterion, optimizer):
     loss_epoch = 0
     accuracy_epoch = 0
     model.eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device
 
     for step, (x, y) in enumerate(loader):
         model.zero_grad()
@@ -110,6 +110,8 @@ if __name__ == "__main__":
         parser.add_argument(f"--{k}", default=v, type=type(v))
 
     args = parser.parse_args()
+
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.dataset == "STL10":
         train_dataset = torchvision.datasets.STL10(
@@ -161,20 +163,20 @@ if __name__ == "__main__":
 
     simclr_model = SimCLR(encoder, args.projection_dim, n_features)
     model_fp = os.path.join(args.model_path, "checkpoint_{}.tar".format(args.epoch_num))
-    simclr_model.load_state_dict(torch.load(model_fp, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
-    simclr_model = simclr_model.to(device)
+    simclr_model.load_state_dict(torch.load(model_fp, map_location=args.device))
+    simclr_model = simclr_model.to(args.device)
     simclr_model.eval()
 
     n_classes = 10
     model = LogisticRegression(simclr_model.n_features, n_classes)
-    model = model.to(device)
+    model = model.to(args.device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     criterion = torch.nn.CrossEntropyLoss()
 
     print("### Creating features from pre-trained context model ###")
     (train_X, train_y, test_X, test_y) = get_features(
-        simclr_model, train_loader, test_loader, device
+        simclr_model, train_loader, test_loader, args.device
     )
 
     arr_train_loader, arr_test_loader = create_data_loaders_from_arrays(

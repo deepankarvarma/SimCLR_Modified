@@ -117,7 +117,9 @@ def test_fn(args, loader, simclr_model, model, criterion, optimizer):
 
 def main(index, args):
     args.device = xm.xla_device()
-
+    if xm.xla_device() == xm.xla_device(devkind='TPU'):
+        devices = xm.get_xla_supported_devices()
+        xm.xla_device(devices[index], devkind='TPU')
     if args.dataset == "STL10":
         train_dataset = torchvision.datasets.STL10(
             args.dataset_dir,

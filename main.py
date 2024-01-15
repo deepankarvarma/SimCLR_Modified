@@ -63,8 +63,8 @@ def main(gpu, args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    if args.dataset == "STL10":
-        train_dataset = torchvision.datasets.STL10(
+    if args.dataset == "ImageNet":
+        train_dataset = torchvision.datasets.ImageNet(
             args.dataset_dir,
             split="unlabeled",
             download=True,

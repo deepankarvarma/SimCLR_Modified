@@ -66,7 +66,6 @@ def main(gpu, args):
     if args.dataset == "ImageNet":
         train_dataset = torchvision.datasets.ImageNet(
             args.dataset_dir,
-            split="unlabeled",
             download=True,
             transform=TransformsSimCLR(size=args.image_size),
         )
